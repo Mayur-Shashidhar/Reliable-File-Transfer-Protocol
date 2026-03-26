@@ -1,97 +1,101 @@
 import socket
-import os
-import hashlib
+import struct
 import time
+import hmac
+import hashlib
+from cryptography.fernet import Fernet
+import base64
 
-from packet import (
-    BUFFER_SIZE, SERVER_IP, SERVER_PORT,
-    FLAG_DATA, FLAG_ACK, FLAG_START, FLAG_END,
-    FLAG_RESUME_REQ, FLAG_RESUME_ACK,
-    create_packet, parse_packet,
-)
+SERVER_IP = "127.0.0.1"
+SERVER_PORT = 5000
 
-CHUNK_SIZE = 1024
-WINDOW_SIZE = 5
-TIMEOUT = 1.0
+WINDOW_SIZE = 4
+TIMEOUT = 2
+BUFFER_SIZE = 4096
 
+FLAG_DATA = 1
+FLAG_ACK = 2
+FLAG_END = 4
 
-def compute_file_hash(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(8192):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+# Shared key
+SHARED_KEY = b'0123456789abcdef0123456789abcdef'
+fernet_key = base64.urlsafe_b64encode(SHARED_KEY)
+cipher = Fernet(fernet_key)
 
 
-def get_chunks(filepath):
+# -------------------------------
+# Packet functions
+# -------------------------------
+def create_packet(seq, flags, data=b''):
+    header = struct.pack("!II", seq, flags)
+    return header + data
+
+
+def parse_packet(packet):
+    if len(packet) < 8:
+        return None
+    seq, flags = struct.unpack("!II", packet[:8])
+    data = packet[8:]
+    return {"seq_num": seq, "flags": flags, "data": data}
+
+
+# -------------------------------
+# Security functions
+# -------------------------------
+def add_security(data):
+    encrypted = cipher.encrypt(data)
+    tag = hmac.new(SHARED_KEY, encrypted, hashlib.sha256).digest()
+    return tag + encrypted
+
+
+def verify_and_decrypt(data):
+    tag = data[:32]
+    encrypted = data[32:]
+
+    expected = hmac.new(SHARED_KEY, encrypted, hashlib.sha256).digest()
+
+    if not hmac.compare_digest(tag, expected):
+        return None
+
+    return cipher.decrypt(encrypted)
+
+
+# -------------------------------
+# CLIENT
+# -------------------------------
+def send_file(path):
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Read file
     chunks = []
-    with open(filepath, 'rb') as f:
+    with open(path, 'rb') as f:
         while True:
-            data = f.read(CHUNK_SIZE)
+            data = f.read(1024)
             if not data:
                 break
             chunks.append(data)
-    return chunks
 
-
-def request_resume(sock, filename):
-    pkt = create_packet(0, FLAG_RESUME_REQ, filename.encode())
-    sock.sendto(pkt, (SERVER_IP, SERVER_PORT))
-
-    sock.settimeout(TIMEOUT)
-    try:
-        raw, _ = sock.recvfrom(BUFFER_SIZE)
-        packet = parse_packet(raw)
-        if packet and (packet['flags'] & FLAG_RESUME_ACK):
-            last_seq, _ = packet['data'].decode().split(',')
-            return int(last_seq) + 1
-    except:
-        pass
-
-    return 0
-
-
-def wait_for_ready(sock):
-    while True:
-        raw, _ = sock.recvfrom(BUFFER_SIZE)
-        packet = parse_packet(raw)
-        if packet and (packet['flags'] & FLAG_ACK):
-            msg = packet['data'].decode()
-            if msg.startswith("READY"):
-                _, start_from = msg.split(',')
-                return int(start_from)
-
-
-def send_file(filepath):
-    filename = os.path.basename(filepath)
-    chunks = get_chunks(filepath)
     total_chunks = len(chunks)
-    file_hash = compute_file_hash(filepath)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.1)
-
-    resume_from = request_resume(sock, filename)
-
-    start_msg = f"{filename},{total_chunks},{file_hash}".encode()
-    sock.sendto(create_packet(0, FLAG_START, start_msg), (SERVER_IP, SERVER_PORT))
-
-    base = wait_for_ready(sock)
-    print(f"[CLIENT] Starting from chunk {base}")
-
-    next_seq = base
-    acked = set()
+    base = 0
+    next_seq = 0
     timers = {}
+    acked = set()
 
     while base < total_chunks:
 
+        # Send window
         while next_seq < base + WINDOW_SIZE and next_seq < total_chunks:
             if next_seq not in timers:
-                pkt = create_packet(next_seq, FLAG_DATA, chunks[next_seq])
+                secure_data = add_security(chunks[next_seq])
+                pkt = create_packet(next_seq, FLAG_DATA, secure_data)
                 sock.sendto(pkt, (SERVER_IP, SERVER_PORT))
                 timers[next_seq] = time.time()
             next_seq += 1
 
+        # Receive ACK
+        sock.settimeout(0.5)
         try:
             raw, _ = sock.recvfrom(BUFFER_SIZE)
             packet = parse_packet(raw)
@@ -106,34 +110,35 @@ def send_file(filepath):
                 pct = (base / total_chunks) * 100
                 print(f"\r[CLIENT] {base}/{total_chunks} ({pct:.1f}%)", end='', flush=True)
 
-        except:
+        except socket.timeout:
             pass
 
+        # Retransmit
         current_time = time.time()
         for seq in list(timers.keys()):
             if seq not in acked and current_time - timers[seq] > TIMEOUT:
-                pkt = create_packet(seq, FLAG_DATA, chunks[seq])
+                secure_data = add_security(chunks[seq])
+                pkt = create_packet(seq, FLAG_DATA, secure_data)
                 sock.sendto(pkt, (SERVER_IP, SERVER_PORT))
                 timers[seq] = current_time
                 print(f"\n[CLIENT] Retransmitting seq {seq}")
 
+    # END
     sock.sendto(create_packet(0, FLAG_END), (SERVER_IP, SERVER_PORT))
 
     try:
         raw, _ = sock.recvfrom(BUFFER_SIZE)
         packet = parse_packet(raw)
+
         if packet and (packet['flags'] & FLAG_END):
-            print("\n[CLIENT] Server response:", packet['data'].decode())
+            msg = verify_and_decrypt(packet['data'])
+            print("\n[CLIENT] Server:", msg.decode())
     except:
-        print("\n[CLIENT] No final confirmation")
+        print("\n[CLIENT] No confirmation")
 
     sock.close()
 
 
 if __name__ == "__main__":
-    path = input("Enter file path: ").strip()
-
-    if not os.path.exists(path):
-        print("File not found")
-    else:
-        send_file(path)
+    path = input("Enter file path: ")
+    send_file(path)
