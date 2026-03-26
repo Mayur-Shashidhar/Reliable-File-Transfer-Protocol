@@ -1,211 +1,106 @@
 import socket
-import os
+import struct
+import hmac
 import hashlib
-import json
+from cryptography.fernet import Fernet
+import base64
 
-from packet import (
-    BUFFER_SIZE, SERVER_IP, SERVER_PORT,
-    FLAG_DATA, FLAG_ACK, FLAG_START, FLAG_END,
-    FLAG_RESUME_REQ, FLAG_RESUME_ACK,
-    create_packet, parse_packet,
-)
+SERVER_IP = "127.0.0.1"
+PORT = 5000
+BUFFER_SIZE = 4096
 
-OUTPUT_DIR         = 'received_files'
-PROGRESS_FILE      = 'progress.json'
-INACTIVITY_TIMEOUT = 15
+FLAG_DATA = 1
+FLAG_ACK = 2
+FLAG_END = 4
 
-
-def load_progress(filename):
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r') as f:
-            data = json.load(f)
-        if filename in data:
-            return data[filename]
-    return {'last_seq': -1, 'total_chunks': 0}
+# Shared key
+SHARED_KEY = b'0123456789abcdef0123456789abcdef'
+fernet_key = base64.urlsafe_b64encode(SHARED_KEY)
+cipher = Fernet(fernet_key)
 
 
-def save_progress(filename, last_seq, total_chunks):
-    data = {}
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r') as f:
-            data = json.load(f)
-    data[filename] = {'last_seq': last_seq, 'total_chunks': total_chunks}
-    with open(PROGRESS_FILE, 'w') as f:
-        json.dump(data, f)
+# -------------------------------
+# Packet functions
+# -------------------------------
+def create_packet(seq, flags, data=b''):
+    header = struct.pack("!II", seq, flags)
+    return header + data
 
 
-def clear_progress(filename):
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r') as f:
-            data = json.load(f)
-        data.pop(filename, None)
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump(data, f)
+def parse_packet(packet):
+    if len(packet) < 8:
+        return None
+    seq, flags = struct.unpack("!II", packet[:8])
+    data = packet[8:]
+    return {"seq_num": seq, "flags": flags, "data": data}
 
 
-def compute_file_hash(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(8192):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+# -------------------------------
+# Security functions
+# -------------------------------
+def add_security(data):
+    encrypted = cipher.encrypt(data)
+    tag = hmac.new(SHARED_KEY, encrypted, hashlib.sha256).digest()
+    return tag + encrypted
 
 
-def receive_file(sock, client_addr, filename, total_chunks, expected_hash, resume_from=0):
-    print(f"\n[SERVER] Receiving '{filename}' | {total_chunks} chunks | resuming from {resume_from}")
+def verify_and_decrypt(data):
+    tag = data[:32]
+    encrypted = data[32:]
 
-    received_seqs = set(range(resume_from))
-    ooo_buffer    = {}
-    next_in_order = resume_from
+    expected = hmac.new(SHARED_KEY, encrypted, hashlib.sha256).digest()
 
-    temp_path  = os.path.join(OUTPUT_DIR, f"{filename}.tmp")
-    write_mode = 'ab' if resume_from > 0 else 'wb'
+    if not hmac.compare_digest(tag, expected):
+        return None
 
-    # 🔑 Save old timeout and set new one
-    old_timeout = sock.gettimeout()
-    sock.settimeout(INACTIVITY_TIMEOUT)
-
-    try:
-        with open(temp_path, write_mode) as f:
-            while len(received_seqs) < total_chunks:
-                try:
-                    raw, addr = sock.recvfrom(BUFFER_SIZE)
-                except socket.timeout:
-                    print("\n[SERVER] Transfer interrupted — saving progress")
-                    save_progress(filename, next_in_order - 1, total_chunks)
-                    return False
-
-                if addr != client_addr:
-                    continue
-
-                packet = parse_packet(raw)
-                if packet is None:
-                    print("[SERVER] Corrupted packet dropped")
-                    continue
-
-                flags   = packet['flags']
-                seq_num = packet['seq_num']
-
-                if flags & FLAG_END:
-                    print("\n[SERVER] END signal received")
-                    break
-
-                if flags & FLAG_DATA:
-                    # Send ACK
-                    ack = create_packet(seq_num, FLAG_ACK)
-                    sock.sendto(ack, client_addr)
-
-                    if seq_num in received_seqs:
-                        continue
-
-                    received_seqs.add(seq_num)
-
-                    if seq_num == next_in_order:
-                        f.write(packet['data'])
-                        next_in_order += 1
-
-                        while next_in_order in ooo_buffer:
-                            f.write(ooo_buffer.pop(next_in_order))
-                            received_seqs.add(next_in_order)
-                            next_in_order += 1
-                    else:
-                        ooo_buffer[seq_num] = packet['data']
-
-                    pct = len(received_seqs) / total_chunks * 100
-                    print(f"\r[SERVER] {len(received_seqs)}/{total_chunks} ({pct:.1f}%)", end='', flush=True)
-
-                    if len(received_seqs) % 100 == 0:
-                        save_progress(filename, next_in_order - 1, total_chunks)
-
-    except Exception as e:
-        print(f"\n[SERVER] Error: {e}")
-        save_progress(filename, next_in_order - 1, total_chunks)
-        return False
-
-    finally:
-        # 🔑 ALWAYS restore timeout
-        sock.settimeout(old_timeout)
-
-    if ooo_buffer:
-        with open(temp_path, 'ab') as f:
-            for seq in sorted(ooo_buffer):
-                f.write(ooo_buffer[seq])
-
-    print(f"\n[SERVER] All chunks received. Verifying hash...")
-
-    actual_hash = compute_file_hash(temp_path)
-
-    if actual_hash == expected_hash:
-        final_path = os.path.join(OUTPUT_DIR, filename)
-        os.replace(temp_path, final_path)
-        print(f"[SERVER] Hash match — file saved to {final_path}")
-        clear_progress(filename)
-        sock.sendto(create_packet(0, FLAG_END, b'SUCCESS'), client_addr)
-        return True
-    else:
-        print(f"[SERVER] Hash mismatch — file corrupted")
-        sock.sendto(create_packet(0, FLAG_END, b'HASH_FAIL'), client_addr)
-        return False
+    return cipher.decrypt(encrypted)
 
 
-def run_server():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# -------------------------------
+# SERVER
+# -------------------------------
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((SERVER_IP, PORT))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((SERVER_IP, SERVER_PORT))
-    sock.settimeout(None)  # 🔑 Always blocking in main loop
+print("[SERVER] Secure UDP server running...")
 
-    print(f"[SERVER] Listening on {SERVER_IP}:{SERVER_PORT}")
+received = {}
 
-    while True:
-        try:
-            raw, client_addr = sock.recvfrom(BUFFER_SIZE)
-        except KeyboardInterrupt:
-            print("\n[SERVER] Shutting down")
-            break
+while True:
+    raw, addr = sock.recvfrom(BUFFER_SIZE)
 
-        packet = parse_packet(raw)
-        if packet is None:
+    packet = parse_packet(raw)
+    if not packet:
+        continue
+
+    seq = packet['seq_num']
+    flags = packet['flags']
+
+    # DATA
+    if flags & FLAG_DATA:
+        decrypted = verify_and_decrypt(packet['data'])
+
+        if decrypted is None:
+            print(f"[SERVER] Packet {seq} failed authentication")
             continue
 
-        flags = packet['flags']
+        print(f"[SERVER] Received seq {seq}")
 
-        if flags & FLAG_RESUME_REQ:
-            filename     = packet['data'].decode()
-            progress     = load_progress(filename)
-            last_seq     = progress['last_seq']
-            total_chunks = progress['total_chunks']
+        received[seq] = decrypted
 
-            print(f"[SERVER] Resume request for '{filename}' — last_seq={last_seq}")
+        ack = create_packet(seq, FLAG_ACK)
+        sock.sendto(ack, addr)
 
-            reply = f"{last_seq},{total_chunks}".encode()
-            sock.sendto(create_packet(0, FLAG_RESUME_ACK, reply), client_addr)
+    # END
+    elif flags & FLAG_END:
+        print("[SERVER] Transfer complete")
 
-        elif flags & FLAG_START:
-            try:
-                info = packet['data'].decode()
-                filename, n_str, file_hash = info.split(',', 2)
-                total_chunks = int(n_str)
-            except Exception as e:
-                print(f"[SERVER] Bad START packet: {e}")
-                continue
+        with open("received_file.txt", "wb") as f:
+            for i in sorted(received.keys()):
+                f.write(received[i])
 
-            print(f"[SERVER] New transfer: '{filename}' | {total_chunks} chunks")
+        msg = add_security(b"File received securely")
+        sock.sendto(create_packet(0, FLAG_END, msg), addr)
+        break
 
-            progress    = load_progress(filename)
-            resume_from = 0
-
-            if progress['last_seq'] >= 0 and progress['total_chunks'] == total_chunks:
-                resume_from = progress['last_seq'] + 1
-                print(f"[SERVER] Resuming from chunk {resume_from}")
-
-            ready_msg = f"READY,{resume_from}".encode()
-            sock.sendto(create_packet(0, FLAG_ACK, ready_msg), client_addr)
-
-            success = receive_file(sock, client_addr, filename, total_chunks, file_hash, resume_from)
-
-            print(f"[SERVER] Transfer {'SUCCESS' if success else 'FAILED'} for '{filename}'\n")
-
-
-if __name__ == '__main__':
-    run_server()
+sock.close()
