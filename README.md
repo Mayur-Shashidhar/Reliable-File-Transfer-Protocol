@@ -8,6 +8,14 @@ Since UDP does not provide reliability, ordering, or retransmission, this system
 
 ---
 
+## 📖 Course Information
+
+- Course Name : Computer Networks
+- Course Code : UE24CS252B
+
+---
+
+
 ## 🎯 Key Features
 
 * ✅ Reliable data transfer over UDP
